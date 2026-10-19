@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "Saplaya",
+    "slug": "saplaya",
+    "scheme": "saplaya",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#F9FBF7",
+    "splash": {
+      "backgroundColor": "#F9FBF7"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.saplaya.app"
+    },
+    "android": {
+      "package": "com.saplaya.app"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Saplaya uses your location to check for free close-area delivery."
+        }
+      ],
+      "expo-web-browser"
+    ]
+  }
+}

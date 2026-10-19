@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# Environment files (keep templates)
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Generated files and logs
+coverage/
+*.log
+
+# Android build outputs and local configuration
+android/.gradle/
+android/**/build/
+android/**/.cxx/
+android/local.properties
+
+# Signing keys
+*.keystore
+*.jks
