@@ -1,5 +1,5 @@
 -- Run after schema.sql to enable customer accounts, reviews, supplier applications,
--- secure Flutterwave checkout, and idempotent paid-order creation.
+-- secure Pesapal checkout, and idempotent paid-order creation.
 
 create table if not exists public.customer_profiles (
   customer_id uuid primary key references auth.users(id) on delete cascade,
@@ -34,17 +34,22 @@ create index if not exists customer_reviews_owner_idx
 
 create table if not exists public.supplier_applications (
   id uuid primary key default gen_random_uuid(),
-  customer_id uuid not null references auth.users(id) on delete cascade,
+  customer_id uuid references auth.users(id) on delete set null,
   farm_name text not null,
   contact_name text not null,
   email text not null,
   phone text not null,
   location text not null,
+  region text,
+  farm_size text,
   products text not null,
   status text not null default 'pending'
     check (status in ('pending', 'reviewing', 'approved', 'declined')),
   created_at timestamptz not null default now()
 );
+alter table public.supplier_applications alter column customer_id drop not null;
+alter table public.supplier_applications add column if not exists region text;
+alter table public.supplier_applications add column if not exists farm_size text;
 create index if not exists supplier_applications_owner_idx
   on public.supplier_applications (customer_id, created_at desc);
 
@@ -103,6 +108,15 @@ create table if not exists public.checkout_payments (
 alter table public.checkout_payments enable row level security;
 revoke all on public.checkout_payments from anon, authenticated;
 grant all on public.checkout_payments to service_role;
+
+create table if not exists public.payment_provider_config (
+  provider text primary key check (provider = 'pesapal'),
+  ipn_id text not null,
+  updated_at timestamptz not null default now()
+);
+alter table public.payment_provider_config enable row level security;
+revoke all on public.payment_provider_config from anon, authenticated;
+grant all on public.payment_provider_config to service_role;
 
 -- Prevent mobile clients from bypassing payment by invoking the legacy order RPC directly.
 revoke all on function public.place_order(uuid, text, jsonb, integer, numeric, double precision, double precision)
@@ -179,9 +193,9 @@ revoke all on function public.place_paid_order(uuid, text, jsonb, integer, numer
 grant execute on function public.place_paid_order(uuid, text, jsonb, integer, numeric, double precision, double precision)
   to service_role;
 
-create or replace function public.complete_flutterwave_payment(
+create or replace function public.complete_pesapal_payment(
   p_transaction_ref text,
-  p_gateway_transaction_id text
+  p_order_tracking_id text
 ) returns uuid
 language plpgsql
 security definer
@@ -202,10 +216,14 @@ begin
   end if;
 
   if v_payment.order_id is not null then
-    if v_payment.gateway_transaction_id <> p_gateway_transaction_id then
+    if v_payment.gateway_transaction_id <> p_order_tracking_id then
       raise exception 'Payment transaction does not match';
     end if;
     return v_payment.order_id;
+  end if;
+
+  if v_payment.gateway_transaction_id is distinct from p_order_tracking_id then
+    raise exception 'Payment tracking ID does not match';
   end if;
 
   if v_payment.status <> 'pending' then
@@ -231,7 +249,6 @@ begin
 
   update public.checkout_payments
     set status = 'paid',
-        gateway_transaction_id = p_gateway_transaction_id,
         order_id = v_order_id,
         paid_at = now()
     where transaction_ref = p_transaction_ref;
@@ -240,8 +257,9 @@ begin
 end;
 $$;
 
-revoke all on function public.complete_flutterwave_payment(text, text) from public, anon, authenticated;
-grant execute on function public.complete_flutterwave_payment(text, text) to service_role;
+revoke all on function public.complete_pesapal_payment(text, text) from public, anon, authenticated;
+grant execute on function public.complete_pesapal_payment(text, text) to service_role;
+drop function if exists public.complete_flutterwave_payment(text, text);
 
 insert into storage.buckets (id, name, public)
 values ('customer-avatars', 'customer-avatars', true)

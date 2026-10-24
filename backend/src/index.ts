@@ -1,35 +1,94 @@
+import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClientOptions } from '@supabase/supabase-js';
+import WebSocket from 'ws';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
+import {
+  getTransactionStatus,
+  isPaymentCompleted,
+  isPaymentFailed,
+  registerIpn,
+  submitOrder,
+} from './pesapal.js';
 
 const {
   SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
+  SUPABASE_SECRET_KEY,
   PORT = '3000',
   STORE_LAT = '-6.1630', // Dodoma pickup hub
   STORE_LNG = '35.7516',
-  FLUTTERWAVE_SECRET_KEY,
   PUBLIC_API_URL,
   PAYMENT_APP_CALLBACK_URL = 'saplaya://payment-callback',
+  WEB_ORIGIN = '*', // e.g. https://admin.saplaya.com
 } = process.env;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error('Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY');
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  throw new Error('Set SUPABASE_URL and SUPABASE_SECRET_KEY');
 }
 
-// Service-role client: bypasses RLS. NEVER ship this key inside the mobile app.
-const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+// Secret-key client: bypasses RLS. NEVER ship this key inside the mobile app.
+type RealtimeTransport = NonNullable<
+  NonNullable<SupabaseClientOptions<'public'>['realtime']>['transport']
+>;
+// ws is runtime-compatible; its Node event types differ from Supabase's browser-shaped interface.
+const realtimeTransport = WebSocket as unknown as RealtimeTransport;
+const db = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
   auth: { persistSession: false },
+  realtime: { transport: realtimeTransport },
 });
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: WEB_ORIGIN === '*' ? true : WEB_ORIGIN.split(',') }));
 app.use(express.json());
 
-// ---------- Auth helpers ----------
-type AuthedRequest = Request & { userId?: string; supplierId?: string };
+// ======================================================================
+// Roles and permissions (the web admin panel mirrors this table)
+// ======================================================================
+type Role = 'platform_owner' | 'platform_manager' | 'supplier_owner' | 'supplier_staff' | 'driver';
+type Perm =
+  | 'dashboard.view' | 'orders.view' | 'orders.update_status'
+  | 'products.view' | 'products.edit' | 'stock.adjust' | 'inventory.view'
+  | 'suppliers.view_all' | 'suppliers.manage'
+  | 'team.view' | 'team.manage' | 'settings.manage';
+
+const ALL: Perm[] = [
+  'dashboard.view', 'orders.view', 'orders.update_status', 'products.view', 'products.edit',
+  'stock.adjust', 'inventory.view', 'suppliers.view_all', 'suppliers.manage',
+  'team.view', 'team.manage', 'settings.manage',
+];
+
+const PERMISSIONS: Record<Role, Perm[]> = {
+  // Products and stock belong to the farms: even the Saplaya owner cannot change a farm's prices or stock.
+  platform_owner: ALL.filter((p) => p !== 'products.edit' && p !== 'stock.adjust'),
+  platform_manager: [
+    'dashboard.view', 'orders.view', 'orders.update_status', 'products.view',
+    'inventory.view', 'suppliers.view_all', 'suppliers.manage', 'team.view',
+  ],
+  supplier_owner: [
+    'dashboard.view', 'orders.view', 'orders.update_status', 'products.view', 'products.edit',
+    'stock.adjust', 'inventory.view', 'team.view', 'team.manage',
+  ],
+  supplier_staff: [
+    'dashboard.view', 'orders.view', 'orders.update_status', 'products.view',
+    'stock.adjust', 'inventory.view',
+  ],
+  driver: ['orders.view', 'orders.update_status'],
+};
+
+// A driver may only move an order along the road; they cannot pack or cancel.
+const DRIVER_STATUSES = ['en_route', 'delivered'];
+// Roles a farm owner may hand out. Platform roles can never be created by a farm.
+const FARM_ASSIGNABLE: Role[] = ['supplier_staff'];
+
+type Member = {
+  id: string; user_id: string; supplier_id: string | null;
+  full_name: string; email: string; role: Role; status: string;
+};
+type AuthedRequest = Request & { userId?: string; member?: Member };
+
+const isPlatform = (m: Member) => m.role === 'platform_owner' || m.role === 'platform_manager' || m.role === 'driver';
 
 async function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -40,14 +99,43 @@ async function requireUser(req: AuthedRequest, res: Response, next: NextFunction
   next();
 }
 
-async function requireSupplier(req: AuthedRequest, res: Response, next: NextFunction) {
-  await requireUser(req, res, async () => {
-    const { data } = await db.from('suppliers').select('id').eq('admin_user_id', req.userId!).maybeSingle();
-    if (!data) return res.status(403).json({ error: 'Not a supplier admin' });
-    req.supplierId = data.id;
-    next();
-  });
+/** Loads the signed-in person's team record and checks they hold the permission. */
+function requirePerm(perm?: Perm) {
+  return async (req: AuthedRequest, res: Response, next: NextFunction) => {
+    await requireUser(req, res, async () => {
+      const { data } = await db
+        .from('team_members')
+        .select('id, user_id, supplier_id, full_name, email, role, status')
+        .eq('user_id', req.userId!)
+        .maybeSingle();
+      let m = data as Member | null;
+      if (!m || m.status === 'suspended') return res.status(403).json({ error: 'No active team account' });
+      if (m.status === 'invited') {
+        const { data: activated, error: activateError } = await db.from('team_members')
+          .update({ status: 'active' })
+          .eq('id', m.id)
+          .eq('user_id', req.userId!)
+          .eq('status', 'invited')
+          .select('id, user_id, supplier_id, full_name, email, role, status')
+          .maybeSingle();
+        if (activateError || !activated) {
+          return res.status(403).json({ error: 'Could not activate this team invitation.' });
+        }
+        m = activated as Member;
+      }
+      if (perm && !PERMISSIONS[m.role].includes(perm)) {
+        return res.status(403).json({ error: 'Your role is not allowed to do this' });
+      }
+      if (m.supplier_id) {
+        const { data: s } = await db.from('suppliers').select('status').eq('id', m.supplier_id).maybeSingle();
+        if (s?.status !== 'active') return res.status(403).json({ error: 'This farm account is not active' });
+      }
+      req.member = m;
+      next();
+    });
+  };
 }
+
 
 // ---------- Delivery tiers (single source of truth; the app mirrors this) ----------
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number) {
@@ -57,14 +145,23 @@ function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number) {
     Math.cos(r(lat1)) * Math.cos(r(lat2)) * Math.sin(r(lng2 - lng1) / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
-function deliveryFor(km: number) {
-  if (km <= 5) return 0;
-  if (km <= 10) return 2000;
-  return 4000;
+function deliveryFor(km: number, settings: {
+  free_radius_km: number; mid_radius_km: number; mid_fee: number; far_fee: number;
+}) {
+  if (km <= Number(settings.free_radius_km)) return 0;
+  if (km <= Number(settings.mid_radius_km)) return Number(settings.mid_fee);
+  return Number(settings.far_fee);
 }
 
 // ---------- Customer routes (suppliers are never exposed) ----------
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', async (_req, res) => {
+  const { error } = await db.from('storefront_products').select('id').limit(0);
+  if (error) {
+    console.error('Health check failed: Supabase storefront query is unavailable.', error);
+    return res.status(503).json({ ok: false, service: 'saplaya-api', database: 'unavailable' });
+  }
+  res.json({ ok: true, service: 'saplaya-api', database: 'connected' });
+});
 
 app.get('/products', async (req, res) => {
   const page = Math.max(0, Number(req.query.page ?? 0));
@@ -120,38 +217,28 @@ const applicationSchema = z.object({
   products: z.string().trim().min(2).max(1000),
 });
 
-function isFlutterwaveConfigured() {
-  return Boolean(FLUTTERWAVE_SECRET_KEY && PUBLIC_API_URL);
-}
-
-async function flutterwaveRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  if (!FLUTTERWAVE_SECRET_KEY) throw new Error('Flutterwave checkout is not configured.');
-
-  const response = await fetch(`https://api.flutterwave.com/v3/${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
-      'Content-Type': 'application/json',
-      ...init?.headers,
-    },
-  });
-  const result = await response.json() as {
-    status?: string;
-    message?: string;
-    data?: T;
-  };
-  if (!response.ok || result.status !== 'success' || result.data === undefined) {
-    throw new Error(result.message ?? 'Flutterwave could not process the request.');
-  }
-  return result.data;
-}
-
-function paymentCallbackUrl(transactionRef: string, transactionId: string, status: string) {
+function paymentCallbackUrl(transactionRef: string, orderTrackingId: string) {
   const callback = new URL(PAYMENT_APP_CALLBACK_URL);
   callback.searchParams.set('tx_ref', transactionRef);
-  callback.searchParams.set('transaction_id', transactionId);
-  callback.searchParams.set('status', status);
+  callback.searchParams.set('order_tracking_id', orderTrackingId);
   return callback.toString();
+}
+
+function isPesapalConfigured() {
+  return Boolean(
+    (process.env.PESAPAL_CONSUMER_KEY || process.env.PESAPAL_CUSTOMER_KEY)
+    && (process.env.PESAPAL_CONSUMER_SECRET || process.env.PESAPAL_CUSTOMER_SECRET)
+    && PUBLIC_API_URL,
+  );
+}
+
+function normalizedTanzanianPhone(phone: string): string | null {
+  const compact = phone.replace(/[\s()-]/g, '');
+  if (!/^(?:\+?255|0)?[1-9]\d{8}$/.test(compact)) return null;
+  if (compact.startsWith('+255')) return compact;
+  if (compact.startsWith('255')) return `+${compact}`;
+  if (compact.startsWith('0')) return `+255${compact.slice(1)}`;
+  return `+255${compact}`;
 }
 
 app.get('/orders', requireUser, async (req: AuthedRequest, res) => {
@@ -166,13 +253,28 @@ app.get('/orders', requireUser, async (req: AuthedRequest, res) => {
 });
 
 app.post('/payments/initialize', requireUser, async (req: AuthedRequest, res) => {
-  if (!isFlutterwaveConfigured()) {
-    return res.status(503).json({ error: 'Flutterwave checkout is not configured on the server.' });
+  if (!isPesapalConfigured()) {
+    return res.status(503).json({ error: 'Pesapal checkout is not configured on the server.' });
   }
 
   const parsed = checkoutSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const { mode, items, lat, lng, customer } = parsed.data;
+  const phone = normalizedTanzanianPhone(customer.phone);
+  if (!phone) return res.status(400).json({ error: 'Enter a valid Tanzanian mobile number.' });
+
+  const { data: providerConfig, error: configError } = await db
+    .from('payment_provider_config')
+    .select('ipn_id')
+    .eq('provider', 'pesapal')
+    .maybeSingle();
+  if (configError) {
+    console.error('Could not load Pesapal configuration:', configError.message);
+    return res.status(500).json({ error: 'Could not prepare payment checkout.' });
+  }
+  if (!providerConfig?.ipn_id) {
+    return res.status(503).json({ error: 'Pesapal notifications have not been configured.' });
+  }
 
   const { data: products, error: productError } = await db
     .from('products')
@@ -201,8 +303,17 @@ app.post('/payments/initialize', requireUser, async (req: AuthedRequest, res) =>
     subtotal += Math.round(price * item.qty);
   }
 
+  const { data: deliverySettings, error: settingsError } = await db
+    .from('platform_settings')
+    .select('free_radius_km, mid_radius_km, mid_fee, far_fee')
+    .eq('id', 'primary')
+    .maybeSingle();
+  if (settingsError || !deliverySettings) {
+    console.error('Could not load delivery pricing settings:', settingsError?.message ?? 'Settings are not initialized.');
+    return res.status(503).json({ error: 'Checkout pricing is not configured.' });
+  }
   const distance = haversineKm(Number(STORE_LAT), Number(STORE_LNG), lat, lng);
-  const fee = deliveryFor(distance);
+  const fee = deliveryFor(distance, deliverySettings);
   const amount = subtotal + fee;
   const transactionRef = `saplaya-${randomUUID()}`;
   const { error: paymentError } = await db.from('checkout_payments').insert({
@@ -225,29 +336,43 @@ app.post('/payments/initialize', requireUser, async (req: AuthedRequest, res) =>
     return res.status(500).json({ error: 'Could not start checkout. Please try again.' });
   }
 
+  let orderTrackingId: string | undefined;
   try {
-    const payment = await flutterwaveRequest<{ link: string }>('payments', {
-      method: 'POST',
-      body: JSON.stringify({
-        tx_ref: transactionRef,
-        amount,
-        currency: 'TZS',
-        redirect_url: `${PUBLIC_API_URL!.replace(/\/+$/, '')}/payments/callback`,
-        customer: {
-          email: customer.email,
-          phonenumber: customer.phone,
-          name: customer.name,
-        },
-        customizations: {
-          title: 'Saplaya',
-          description: 'Fresh groceries delivery',
-        },
-      }),
+    const order = await submitOrder({
+      reference: transactionRef,
+      amount,
+      callbackUrl: `${PUBLIC_API_URL!.replace(/\/+$/, '')}/payments/callback`,
+      ipnId: providerConfig.ipn_id,
+      email: customer.email,
+      phone,
+      name: customer.name,
     });
-    if (!payment.link) throw new Error('Flutterwave did not return a checkout link.');
+    orderTrackingId = order.order_tracking_id;
+    if (order.merchant_reference !== transactionRef) {
+      throw new Error('Pesapal returned a merchant reference that does not match this checkout.');
+    }
+    const { data: savedPayment, error: trackingError } = await db
+      .from('checkout_payments')
+      .update({ gateway_transaction_id: orderTrackingId })
+      .eq('transaction_ref', transactionRef)
+      .eq('status', 'pending')
+      .select('transaction_ref')
+      .maybeSingle();
+    if (trackingError || !savedPayment) {
+      console.error('Pesapal order was created but its tracking ID could not be saved:', {
+        transactionRef,
+        orderTrackingId,
+        error: trackingError?.message ?? 'Checkout record was not updated.',
+      });
+      return res.status(503).json({
+        error: 'Payment was created but could not be synchronized. Please contact support before retrying.',
+        tx_ref: transactionRef,
+      });
+    }
     return res.status(201).json({
-      payment_url: payment.link,
+      payment_url: order.redirect_url,
       tx_ref: transactionRef,
+      order_tracking_id: orderTrackingId,
       amount,
       currency: 'TZS',
       delivery_fee: fee,
@@ -256,35 +381,41 @@ app.post('/payments/initialize', requireUser, async (req: AuthedRequest, res) =>
       items: pricedItems,
     });
   } catch (error) {
-    await db.from('checkout_payments').update({ status: 'failed' }).eq('transaction_ref', transactionRef);
-    console.error('Flutterwave payment initialization failed:', error);
+    if (!orderTrackingId) {
+      const { error: updateError } = await db
+        .from('checkout_payments')
+        .update({ status: 'failed' })
+        .eq('transaction_ref', transactionRef)
+        .eq('status', 'pending');
+      if (updateError) console.error('Could not mark failed Pesapal initialization:', updateError.message);
+    }
+    console.error('Pesapal payment initialization failed:', error);
     return res.status(502).json({ error: 'Could not open secure payment checkout. Please try again.' });
   }
 });
 
 app.get('/payments/callback', (req, res) => {
-  const transactionRef = String(req.query.tx_ref ?? '');
-  const transactionId = String(req.query.transaction_id ?? '');
-  const status = String(req.query.status ?? 'failed');
-  if (!/^saplaya-[0-9a-f-]{36}$/i.test(transactionRef) || !/^\d+$/.test(transactionId)) {
-    return res.redirect(302, paymentCallbackUrl('', '', 'failed'));
+  const transactionRef = String(req.query.OrderMerchantReference ?? req.query.tx_ref ?? '');
+  const orderTrackingId = String(req.query.OrderTrackingId ?? req.query.order_tracking_id ?? '');
+  if (!/^saplaya-[0-9a-f-]{36}$/i.test(transactionRef) || !orderTrackingId) {
+    return res.redirect(302, paymentCallbackUrl('', ''));
   }
-  res.redirect(302, paymentCallbackUrl(transactionRef, transactionId, status));
+  return res.redirect(302, paymentCallbackUrl(transactionRef, orderTrackingId));
 });
 
 const confirmPaymentSchema = z.object({
   tx_ref: z.string().regex(/^saplaya-[0-9a-f-]{36}$/i),
-  transaction_id: z.string().regex(/^\d+$/),
+  order_tracking_id: z.string().min(1).max(200),
 });
 
 app.post('/payments/confirm', requireUser, async (req: AuthedRequest, res) => {
-  if (!FLUTTERWAVE_SECRET_KEY) {
-    return res.status(503).json({ error: 'Flutterwave checkout is not configured on the server.' });
+  if (!isPesapalConfigured()) {
+    return res.status(503).json({ error: 'Pesapal checkout is not configured on the server.' });
   }
   const parsed = confirmPaymentSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
-  const { tx_ref: transactionRef, transaction_id: transactionId } = parsed.data;
+  const { tx_ref: transactionRef, order_tracking_id: orderTrackingId } = parsed.data;
   const { data: payment, error: paymentError } = await db
     .from('checkout_payments')
     .select('amount, currency, status, order_id, gateway_transaction_id')
@@ -293,31 +424,44 @@ app.post('/payments/confirm', requireUser, async (req: AuthedRequest, res) => {
     .maybeSingle();
   if (paymentError) return res.status(500).json({ error: 'Could not verify this checkout.' });
   if (!payment) return res.status(404).json({ error: 'Payment reference was not found for this account.' });
+  if (payment.gateway_transaction_id !== orderTrackingId) {
+    return res.status(400).json({ error: 'Payment tracking details do not match this checkout.' });
+  }
+  if (payment.status === 'paid' && payment.order_id) {
+    return res.json({ order_id: payment.order_id });
+  }
 
   try {
-    const verified = await flutterwaveRequest<{
-      id: number;
-      tx_ref: string;
-      status: string;
-      amount: number;
-      currency: string;
-    }>(`transactions/${encodeURIComponent(transactionId)}/verify`);
+    const verified = await getTransactionStatus(orderTrackingId);
     if (
-      String(verified.id) !== transactionId
-      || verified.tx_ref !== transactionRef
-      || verified.status !== 'successful'
-      || Math.round(Number(verified.amount)) !== Number(payment.amount)
-      || verified.currency !== payment.currency
+      (verified.order_tracking_id && verified.order_tracking_id !== orderTrackingId)
+      || (verified.merchant_reference && verified.merchant_reference !== transactionRef)
     ) {
-      if (verified.tx_ref === transactionRef && ['failed', 'cancelled'].includes(verified.status) && payment.status === 'pending') {
-        await db.from('checkout_payments').update({ status: 'failed' }).eq('transaction_ref', transactionRef);
+      return res.status(400).json({ error: 'Pesapal returned transaction details that do not match this checkout.' });
+    }
+    if (!isPaymentCompleted(verified)) {
+      if (isPaymentFailed(verified)) {
+        const { error: updateError } = await db
+          .from('checkout_payments')
+          .update({ status: 'failed' })
+          .eq('transaction_ref', transactionRef)
+          .eq('status', 'pending');
+        if (updateError) {
+          console.error('Could not mark failed Pesapal checkout:', updateError.message);
+          return res.status(500).json({ error: 'Could not update payment status.' });
+        }
+        return res.status(402).json({ error: 'Pesapal confirmed that this payment was not completed.' });
       }
-      return res.status(402).json({ error: 'Payment has not been verified. You have not been charged for an order.' });
+      return res.status(202).json({ status: 'pending', message: 'Payment has not been confirmed yet.' });
+    }
+    if (Math.round(Number(verified.amount)) !== Number(payment.amount) || verified.currency !== payment.currency) {
+      console.error('Pesapal completed payment does not match the expected amount or currency:', transactionRef);
+      return res.status(409).json({ error: 'Payment details do not match this checkout. Please contact support.' });
     }
 
-    const { data: orderId, error } = await db.rpc('complete_flutterwave_payment', {
+    const { data: orderId, error } = await db.rpc('complete_pesapal_payment', {
       p_transaction_ref: transactionRef,
-      p_gateway_transaction_id: transactionId,
+      p_order_tracking_id: orderTrackingId,
     });
     if (error) {
       console.error('Verified payment could not be converted to an order:', error.message);
@@ -325,8 +469,122 @@ app.post('/payments/confirm', requireUser, async (req: AuthedRequest, res) => {
     }
     return res.json({ order_id: orderId });
   } catch (error) {
-    console.error('Flutterwave transaction verification failed:', error);
+    console.error('Pesapal transaction verification failed:', error);
     return res.status(502).json({ error: 'Could not verify the payment right now. Please try again.' });
+  }
+});
+
+app.post('/admin/payments/pesapal/register-ipn', requirePerm('settings.manage'), async (_req, res) => {
+  if (!isPesapalConfigured()) {
+    return res.status(503).json({ error: 'Pesapal credentials and PUBLIC_API_URL must be configured.' });
+  }
+  const { data: existing, error: lookupError } = await db
+    .from('payment_provider_config')
+    .select('ipn_id')
+    .eq('provider', 'pesapal')
+    .maybeSingle();
+  if (lookupError) {
+    console.error('Could not load Pesapal IPN configuration:', lookupError.message);
+    return res.status(500).json({ error: 'Could not check existing Pesapal notification configuration.' });
+  }
+  if (existing?.ipn_id) return res.json({ ipn_id: existing.ipn_id, already_registered: true });
+
+  try {
+    const ipnId = await registerIpn(`${PUBLIC_API_URL!.replace(/\/+$/, '')}/api/v1/payments/pesapal-ipn`);
+    const { error: saveError } = await db.from('payment_provider_config').upsert({
+      provider: 'pesapal',
+      ipn_id: ipnId,
+      updated_at: new Date().toISOString(),
+    });
+    if (saveError) {
+      console.error('Pesapal IPN was registered but could not be saved:', { ipnId, error: saveError.message });
+      return res.status(500).json({ error: 'IPN was registered but could not be saved. Contact support before registering again.' });
+    }
+    console.info('Pesapal IPN registered:', ipnId);
+    return res.status(201).json({ ipn_id: ipnId, already_registered: false });
+  } catch (error) {
+    console.error('Pesapal IPN registration failed:', error);
+    return res.status(502).json({ error: 'Could not register the Pesapal notification URL.' });
+  }
+});
+
+app.get('/api/v1/payments/pesapal-ipn', async (req, res) => {
+  const orderTrackingId = String(req.query.OrderTrackingId ?? req.query.orderTrackingId ?? '');
+  const merchantReference = String(req.query.OrderMerchantReference ?? req.query.merchant_reference ?? '');
+  if (!orderTrackingId) return res.status(400).json({ error: 'Missing Pesapal order tracking ID.' });
+
+  const { data: payment, error: lookupError } = await db
+    .from('checkout_payments')
+    .select('transaction_ref, gateway_transaction_id')
+    .eq('gateway_transaction_id', orderTrackingId)
+    .maybeSingle();
+  if (lookupError) {
+    console.error('Could not find checkout for Pesapal IPN:', lookupError.message);
+    return res.status(503).json({ error: 'Could not process payment notification.' });
+  }
+  if (!payment) {
+    console.warn('Acknowledging Pesapal IPN for an unknown tracking ID:', orderTrackingId);
+    return res.status(200).json({ status: 'acknowledged' });
+  }
+  if (merchantReference && merchantReference !== payment.transaction_ref) {
+    console.error('Pesapal IPN merchant reference did not match its tracking ID:', orderTrackingId);
+    return res.status(200).json({ status: 'acknowledged', processed: false });
+  }
+
+  try {
+    const verified = await getTransactionStatus(orderTrackingId);
+    if (
+      (verified.order_tracking_id && verified.order_tracking_id !== orderTrackingId)
+      || (verified.merchant_reference && verified.merchant_reference !== payment.transaction_ref)
+    ) {
+      console.error('Pesapal status query returned a mismatched transaction:', orderTrackingId);
+      return res.status(200).json({ status: 'acknowledged', processed: false });
+    }
+    if (!isPaymentCompleted(verified)) {
+      if (isPaymentFailed(verified)) {
+        const { error: updateError } = await db
+          .from('checkout_payments')
+          .update({ status: 'failed' })
+          .eq('transaction_ref', payment.transaction_ref)
+          .eq('status', 'pending');
+        if (updateError) {
+          console.error('Could not mark failed Pesapal payment from IPN:', updateError.message);
+          return res.status(503).json({ error: 'Could not update failed payment notification.' });
+        }
+        return res.status(200).json({ status: 'acknowledged', processed: true });
+      }
+      return res.status(200).json({ status: 'acknowledged', processed: false });
+    }
+
+    const { data: paymentDetails, error: paymentDetailsError } = await db
+      .from('checkout_payments')
+      .select('amount, currency')
+      .eq('transaction_ref', payment.transaction_ref)
+      .maybeSingle();
+    if (paymentDetailsError || !paymentDetails) {
+      console.error('Could not load payment details for Pesapal IPN:', paymentDetailsError?.message);
+      return res.status(503).json({ error: 'Could not verify the notified payment.' });
+    }
+    if (
+      Math.round(Number(verified.amount)) !== Number(paymentDetails.amount)
+      || verified.currency !== paymentDetails.currency
+    ) {
+      console.error('Pesapal notified payment amount or currency did not match:', payment.transaction_ref);
+      return res.status(200).json({ status: 'acknowledged', processed: false });
+    }
+
+    const { error: fulfillmentError } = await db.rpc('complete_pesapal_payment', {
+      p_transaction_ref: payment.transaction_ref,
+      p_order_tracking_id: orderTrackingId,
+    });
+    if (fulfillmentError) {
+      console.error('Verified Pesapal IPN could not fulfill its order:', fulfillmentError.message);
+      return res.status(503).json({ error: 'Could not fulfill verified payment notification.' });
+    }
+    return res.status(200).json({ status: 'acknowledged', processed: true });
+  } catch (error) {
+    console.error('Pesapal IPN status verification failed:', error);
+    return res.status(503).json({ error: 'Could not verify payment notification; retry later.' });
   }
 });
 
@@ -349,67 +607,406 @@ app.post('/supplier-applications', requireUser, async (req: AuthedRequest, res) 
   return res.status(201).json(data);
 });
 
-// ---------- Supplier admin routes ----------
-app.get('/admin/orders', requireSupplier, async (req: AuthedRequest, res) => {
-  const { data, error } = await db
+
+// ======================================================================
+// Public: "Become a supplier" form on the landing page
+// ======================================================================
+const applySchema = z.object({
+  farm_name: z.string().min(2).max(120),
+  contact_name: z.string().min(2).max(120),
+  email: z.string().email(),
+  phone: z.string().min(5).max(40),
+  region: z.string().min(2).max(80),
+  produce: z.string().min(2).max(300),
+  farm_size: z.string().min(2).max(60),
+});
+
+app.post('/apply', async (req: Request, res: Response) => {
+  const parsed = applySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { data, error } = await db.from('supplier_applications').insert({
+    customer_id: null,
+    farm_name: parsed.data.farm_name,
+    contact_name: parsed.data.contact_name,
+    email: parsed.data.email,
+    phone: parsed.data.phone,
+    location: parsed.data.region,
+    region: parsed.data.region,
+    farm_size: parsed.data.farm_size,
+    products: parsed.data.produce,
+  }).select('id').single();
+  if (error) {
+    console.error('Could not save public supplier application:', error.message);
+    return res.status(500).json({ error: 'Could not submit your application. Please try again.' });
+  }
+  return res.status(201).json({ ok: true, id: data.id });
+});
+
+// ======================================================================
+// Admin: who am I
+// ======================================================================
+app.get('/admin/me', requirePerm(), (req: AuthedRequest, res: Response) => {
+  const m = req.member!;
+  res.json({ ...m, permissions: PERMISSIONS[m.role] });
+});
+
+// ======================================================================
+// Admin: orders. Platform roles see all farms; farm roles only their own.
+// ======================================================================
+app.get('/admin/orders', requirePerm('orders.view'), async (req: AuthedRequest, res: Response) => {
+  const m = req.member!;
+  let q = db
     .from('supplier_orders')
-    .select('id, order_id, status, updated_at, order_items(qty, unit_price, products(name, unit))')
-    .eq('supplier_id', req.supplierId!)
-    .order('updated_at', { ascending: false });
+    .select('id, order_id, supplier_id, status, updated_at, orders!supplier_orders_order_id_fkey(id, mode, created_at, delivery_fee, dest_lat, dest_lng, customer_id), order_items!order_items_supplier_order_id_fkey(product_id, qty, unit_price, products(name, unit))')
+    .order('updated_at', { ascending: false })
+    .limit(300);
+  if (m.supplier_id) q = q.eq('supplier_id', m.supplier_id);
+  if (m.role === 'driver') q = q.in('status', ['packing', 'en_route', 'delivered']);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  const customerIds = [...new Set((data ?? [])
+    .flatMap((row) => Array.isArray(row.orders) ? row.orders : row.orders ? [row.orders] : [])
+    .map((order) => order.customer_id)
+    .filter(Boolean))];
+  const mayViewCustomerContact = !m.supplier_id;
+  const { data: customers, error: customerError } = mayViewCustomerContact && customerIds.length
+    ? await db.from('customer_profiles').select('customer_id, full_name, phone').in('customer_id', customerIds)
+    : { data: [], error: null };
+  if (customerError) {
+    console.error('Could not load admin order customer details:', customerError.message);
+    return res.status(500).json({ error: 'Could not load orders.' });
+  }
+  const customerById = new Map((customers ?? []).map((customer) => [customer.customer_id, customer]));
+  res.json((data ?? []).map((row) => {
+    const order = Array.isArray(row.orders) ? row.orders[0] : row.orders;
+    const customer = order ? customerById.get(order.customer_id) : undefined;
+    const fullName = customer?.full_name || 'Customer';
+    const customerName = m.supplier_id ? fullName.split(/\s+/)[0] : fullName;
+    const area = order?.dest_lat != null && order?.dest_lng != null
+      ? `${Number(order.dest_lat).toFixed(4)}, ${Number(order.dest_lng).toFixed(4)}`
+      : 'Delivery location';
+    return {
+      id: row.id,
+      order_id: row.order_id,
+      supplier_id: row.supplier_id,
+      status: row.status,
+      updated_at: row.updated_at,
+      code: row.order_id.slice(0, 8).toUpperCase(),
+      order,
+      customer_name: customerName,
+      customer_phone: mayViewCustomerContact ? customer?.phone || '' : '',
+      area,
+      items: (row.order_items ?? []).map((item) => ({
+        product_id: item.product_id,
+        qty: item.qty,
+        unit_price: item.unit_price,
+        product: item.products,
+      })),
+    };
+  }));
 });
 
 const statusSchema = z.object({ status: z.enum(['pending', 'packing', 'en_route', 'delivered', 'cancelled']) });
 
-// This is what makes the customer's tracking screen glow in real time:
-// updating supplier_orders fires the trigger -> orders.status -> Supabase Realtime.
-app.patch('/admin/supplier-orders/:id/status', requireSupplier, async (req: AuthedRequest, res) => {
+// Updating supplier_orders fires the DB trigger -> orders.status -> Supabase Realtime
+// -> the customer's tracking screen glows in the new colour.
+app.patch('/admin/supplier-orders/:id/status', requirePerm('orders.update_status'), async (req: AuthedRequest, res: Response) => {
   const parsed = statusSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  const { data, error } = await db
+  const m = req.member!;
+  if (m.role === 'driver' && !DRIVER_STATUSES.includes(parsed.data.status)) {
+    return res.status(403).json({ error: 'Drivers can only mark orders On the way or Delivered' });
+  }
+  let q = db
     .from('supplier_orders')
     .update({ status: parsed.data.status, updated_at: new Date().toISOString() })
-    .eq('id', req.params.id)
-    .eq('supplier_id', req.supplierId!)
-    .select()
-    .maybeSingle();
+    .eq('id', req.params.id);
+  if (m.supplier_id) q = q.eq('supplier_id', m.supplier_id); // farm roles: own rows only
+  const { data, error } = await q.select().maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: 'Not found' });
   res.json(data);
 });
 
-app.get('/admin/inventory-movements', requireSupplier, async (req: AuthedRequest, res) => {
-  const { data, error } = await db
+// ======================================================================
+// Admin: products, inventory
+// ======================================================================
+app.get('/admin/products', requirePerm('products.view'), async (req: AuthedRequest, res: Response) => {
+  const m = req.member!;
+  let q = db.from('products').select('*').order('name');
+  if (m.supplier_id) q = q.eq('supplier_id', m.supplier_id);
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+const productSchema = z.object({
+  name: z.string().min(2), category: z.string().optional(), unit: z.string().default('kg'),
+  retail_price: z.number().int().positive(), wholesale_price: z.number().int().positive(),
+  wholesale_min_qty: z.number().int().positive().default(10), stock: z.number().min(0).default(0),
+  low_stock_at: z.number().min(0).default(10),
+  image_url: z.string().url().nullable().optional(), active: z.boolean().default(true),
+});
+
+app.post('/admin/products', requirePerm('products.edit'), async (req: AuthedRequest, res: Response) => {
+  const parsed = productSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const m = req.member!;
+  if (!m.supplier_id) return res.status(400).json({ error: 'Products belong to a farm. Sign in as a farm owner.' });
+  const { data, error } = await db.rpc('create_product_with_stock', {
+    p_supplier_id: m.supplier_id,
+    p_name: parsed.data.name,
+    p_category: parsed.data.category ?? null,
+    p_unit: parsed.data.unit,
+    p_retail_price: parsed.data.retail_price,
+    p_wholesale_price: parsed.data.wholesale_price,
+    p_wholesale_min_qty: parsed.data.wholesale_min_qty,
+    p_stock: parsed.data.stock,
+    p_low_stock_at: parsed.data.low_stock_at,
+    p_image_url: parsed.data.image_url ?? null,
+    p_active: parsed.data.active,
+  });
+  if (error) return res.status(500).json({ error: 'Could not create this product.' });
+  res.status(201).json(data);
+});
+
+app.patch('/admin/products/:id', requirePerm('products.edit'), async (req: AuthedRequest, res: Response) => {
+  const parsed = productSchema.partial().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const m = req.member!;
+  if (!m.supplier_id) return res.status(400).json({ error: 'Sign in as a farm owner to edit products.' });
+  const { stock: _ignored, ...safe } = parsed.data; // stock only changes via /admin/restock so every change is logged
+  const { data, error } = await db.from('products').update(safe).eq('id', req.params.id).eq('supplier_id', m.supplier_id).select().maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'Not found' });
+  res.json(data);
+});
+
+app.get('/admin/inventory-movements', requirePerm('inventory.view'), async (req: AuthedRequest, res: Response) => {
+  const m = req.member!;
+  let q = db
     .from('inventory_movements')
-    .select('id, kind, qty_change, stock_after, created_at, order_id, products(name, unit)')
-    .eq('supplier_id', req.supplierId!)
+    .select('id, supplier_id, kind, qty_change, stock_after, created_at, order_id, products(name, unit)')
     .order('created_at', { ascending: false })
     .limit(200);
+  if (m.supplier_id) q = q.eq('supplier_id', m.supplier_id);
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 const restockSchema = z.object({ product_id: z.string().uuid(), qty: z.number().positive() });
 
-app.post('/admin/restock', requireSupplier, async (req: AuthedRequest, res) => {
+app.post('/admin/restock', requirePerm('stock.adjust'), async (req: AuthedRequest, res: Response) => {
   const parsed = restockSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  const { data: p } = await db
-    .from('products')
-    .select('stock')
-    .eq('id', parsed.data.product_id)
-    .eq('supplier_id', req.supplierId!)
-    .maybeSingle();
-  if (!p) return res.status(404).json({ error: 'Product not found' });
-  const stockAfter = Number(p.stock) + parsed.data.qty;
-  await db.from('products').update({ stock: stockAfter, harvested_at: new Date().toISOString() })
-    .eq('id', parsed.data.product_id);
-  await db.from('inventory_movements').insert({
-    supplier_id: req.supplierId, product_id: parsed.data.product_id,
-    kind: 'restock', qty_change: parsed.data.qty, stock_after: stockAfter,
+  const m = req.member!;
+  if (!m.supplier_id) return res.status(400).json({ error: 'Stock belongs to a farm.' });
+  const { data: stockAfter, error } = await db.rpc('restock_product', {
+    p_product_id: parsed.data.product_id,
+    p_qty: parsed.data.qty,
+    p_supplier_id: m.supplier_id,
   });
-  res.json({ stock: stockAfter });
+  if (error) {
+    console.error('Could not restock product:', error.message);
+    return res.status(error.message.includes('not found') ? 404 : 500).json({ error: 'Could not update product stock.' });
+  }
+  return res.json({ stock: stockAfter });
+});
+
+// ======================================================================
+// Admin: suppliers and applications (platform roles only)
+// ======================================================================
+app.get('/admin/suppliers', requirePerm('suppliers.view_all'), async (_req: AuthedRequest, res: Response) => {
+  const { data, error } = await db.from('suppliers').select('*').order('name');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.patch('/admin/suppliers/:id', requirePerm('suppliers.manage'), async (req: AuthedRequest, res: Response) => {
+  const parsed = z.object({ status: z.enum(['pending', 'active', 'suspended']) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { data, error } = await db.from('suppliers').update({ status: parsed.data.status }).eq('id', req.params.id).select().maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+const supplierSchema = z.object({
+  name: z.string().min(2).max(120),
+  region: z.string().min(2).max(80),
+  contact_name: z.string().min(2).max(120),
+  contact_email: z.string().email(),
+  contact_phone: z.string().min(5).max(40),
+});
+
+app.post('/admin/suppliers', requirePerm('suppliers.manage'), async (req: AuthedRequest, res: Response) => {
+  const parsed = supplierSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { data: supplier, error: supplierError } = await db.from('suppliers').insert({
+    name: parsed.data.name,
+    region: parsed.data.region,
+    contact_name: parsed.data.contact_name,
+    contact_email: parsed.data.contact_email,
+    contact_phone: parsed.data.contact_phone,
+    status: 'active',
+  }).select('id').single();
+  if (supplierError) return res.status(500).json({ error: 'Could not create the farm.' });
+
+  const invited = await db.auth.admin.inviteUserByEmail(parsed.data.contact_email);
+  if (invited.error || !invited.data.user) {
+    await db.from('suppliers').delete().eq('id', supplier.id);
+    return res.status(502).json({ error: invited.error?.message ?? 'Could not invite the farm owner.' });
+  }
+  const { data: member, error: memberError } = await db.from('team_members').insert({
+    user_id: invited.data.user.id,
+    supplier_id: supplier.id,
+    full_name: parsed.data.contact_name,
+    email: parsed.data.contact_email,
+    role: 'supplier_owner',
+    status: 'invited',
+  }).select().single();
+  if (memberError) {
+    await db.auth.admin.deleteUser(invited.data.user.id);
+    await db.from('suppliers').delete().eq('id', supplier.id);
+    return res.status(500).json({ error: 'The farm owner invitation could not be saved.' });
+  }
+  return res.status(201).json({ supplier_id: supplier.id, team_member: member });
+});
+
+app.get('/admin/applications', requirePerm('suppliers.manage'), async (_req: AuthedRequest, res: Response) => {
+  const { data, error } = await db.from('supplier_applications').select('*').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// Approve = create the farm + invite its owner by email. Reject = just close it.
+app.post('/admin/applications/:id/:decision', requirePerm('suppliers.manage'), async (req: AuthedRequest, res: Response) => {
+  const decision = req.params.decision;
+  if (decision !== 'approve' && decision !== 'reject') return res.status(400).json({ error: 'Use approve or reject' });
+  const { data: a } = await db.from('supplier_applications').select('*').eq('id', req.params.id).maybeSingle();
+  if (!a || !['pending', 'reviewing', 'new'].includes(a.status)) {
+    return res.status(404).json({ error: 'Application not found or already handled' });
+  }
+
+  if (decision === 'reject') {
+    const { error } = await db.from('supplier_applications').update({ status: 'declined' }).eq('id', a.id);
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true });
+  }
+
+  const { data: s, error: se } = await db.from('suppliers').insert({
+    name: a.farm_name, status: 'active', region: a.region ?? a.location,
+    contact_name: a.contact_name, contact_email: a.email, contact_phone: a.phone,
+  }).select().single();
+  if (se) return res.status(500).json({ error: se.message });
+
+  const invited = await db.auth.admin.inviteUserByEmail(a.email);
+  if (invited.error) return res.status(500).json({ error: invited.error.message });
+  await db.from('team_members').insert({
+    user_id: invited.data.user.id, supplier_id: s.id, full_name: a.contact_name,
+    email: a.email, role: 'supplier_owner', status: 'active',
+  });
+  await db.from('supplier_applications').update({ status: 'approved' }).eq('id', a.id);
+  res.json({ ok: true, supplier_id: s.id });
+});
+
+// ======================================================================
+// Admin: team and roles
+// ======================================================================
+app.get('/admin/team', requirePerm('team.view'), async (req: AuthedRequest, res: Response) => {
+  const m = req.member!;
+  let q = db.from('team_members').select('id, supplier_id, full_name, email, role, status').order('full_name');
+  if (m.supplier_id) q = q.eq('supplier_id', m.supplier_id); // a farm only sees its own people
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+const inviteSchema = z.object({
+  full_name: z.string().min(2),
+  email: z.string().email(),
+  role: z.enum(['platform_manager', 'supplier_owner', 'supplier_staff', 'driver']),
+  supplier_id: z.string().uuid().optional(),
+});
+
+app.post('/admin/team', requirePerm('team.manage'), async (req: AuthedRequest, res: Response) => {
+  const parsed = inviteSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const m = req.member!;
+  let { role, supplier_id } = parsed.data;
+
+  if (m.supplier_id) {
+    // Farm owners can only add packers to their own farm.
+    if (!FARM_ASSIGNABLE.includes(role)) return res.status(403).json({ error: 'A farm owner can only add farm staff' });
+    supplier_id = m.supplier_id;
+  } else if (role === 'supplier_owner' || role === 'supplier_staff') {
+    if (!supplier_id) return res.status(400).json({ error: 'Choose which farm this person belongs to' });
+  } else {
+    supplier_id = undefined;
+  }
+
+  const invited = await db.auth.admin.inviteUserByEmail(parsed.data.email);
+  if (invited.error) return res.status(500).json({ error: invited.error.message });
+  const { data, error } = await db.from('team_members').insert({
+    user_id: invited.data.user.id, supplier_id: supplier_id ?? null,
+    full_name: parsed.data.full_name, email: parsed.data.email, role, status: 'invited',
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+app.patch('/admin/team/:id', requirePerm('team.manage'), async (req: AuthedRequest, res: Response) => {
+  const parsed = z.object({ status: z.enum(['active', 'suspended']) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const m = req.member!;
+  if (req.params.id === m.id) return res.status(400).json({ error: 'You cannot change your own access' });
+  let q = db.from('team_members').update({ status: parsed.data.status }).eq('id', req.params.id);
+  if (m.supplier_id) q = q.eq('supplier_id', m.supplier_id).eq('role', 'supplier_staff');
+  const { data, error } = await q.select().maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'Not found' });
+  res.json(data);
+});
+
+const settingsSchema = z.object({
+  hub_name: z.string().min(2).max(120),
+  free_radius_km: z.number().min(0).max(100),
+  mid_radius_km: z.number().positive().max(200),
+  mid_fee: z.number().int().nonnegative(),
+  far_fee: z.number().int().nonnegative(),
+  commission_pct: z.number().min(0).max(40),
+  wholesale_min_default: z.number().int().positive(),
+}).refine((settings) => settings.mid_radius_km > settings.free_radius_km, {
+  message: 'The standard delivery distance must exceed the free distance.',
+  path: ['mid_radius_km'],
+}).refine((settings) => settings.far_fee >= settings.mid_fee, {
+  message: 'Far delivery cannot cost less than standard delivery.',
+  path: ['far_fee'],
+});
+
+app.get('/admin/settings', requirePerm('settings.manage'), async (_req: AuthedRequest, res: Response) => {
+  const { data, error } = await db.from('platform_settings').select('*').eq('id', 'primary').maybeSingle();
+  if (error) return res.status(500).json({ error: 'Could not load platform settings.' });
+  if (!data) return res.status(503).json({ error: 'Platform settings have not been initialized.' });
+  return res.json(data);
+});
+
+app.put('/admin/settings', requirePerm('settings.manage'), async (req: AuthedRequest, res: Response) => {
+  const parsed = settingsSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { data, error } = await db.from('platform_settings').upsert({
+    id: 'primary',
+    hub_name: parsed.data.hub_name,
+    free_radius_km: parsed.data.free_radius_km,
+    mid_radius_km: parsed.data.mid_radius_km,
+    mid_fee: parsed.data.mid_fee,
+    far_fee: parsed.data.far_fee,
+    commission_pct: parsed.data.commission_pct,
+    wholesale_min_default: parsed.data.wholesale_min_default,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'id' }).select().single();
+  if (error) return res.status(500).json({ error: 'Could not save platform settings.' });
+  return res.json(data);
 });
 
 app.listen(Number(PORT), () => console.log(`Saplaya API on :${PORT}`));

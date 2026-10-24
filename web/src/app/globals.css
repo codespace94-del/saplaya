@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  @apply bg-milk font-body text-ink antialiased;
+}
+
+:focus-visible {
+  outline: 3px solid #ffb300;
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+::selection {
+  background: #ffd54f;
+  color: #15261a;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* A soft field texture used behind the hero and the sign-in panel */
+.field-lines {
+  background-image: repeating-linear-gradient(
+    168deg,
+    rgba(255, 255, 255, 0.07) 0 2px,
+    transparent 2px 34px
+  );
+}

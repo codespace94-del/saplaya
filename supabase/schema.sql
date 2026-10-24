@@ -22,6 +22,7 @@ create table products (
   wholesale_price integer not null,               -- TZS per unit, bulk
   wholesale_min_qty integer not null default 10,
   stock numeric not null default 0,
+  low_stock_at numeric not null default 10,
   image_url text,
   harvested_at timestamptz default now(),
   active boolean default true,
@@ -202,6 +203,3 @@ grant select on storefront_products to anon, authenticated;
 -- ---------- Realtime for the tracking screen ----------
 alter publication supabase_realtime add table orders;
 alter publication supabase_realtime add table supplier_orders;
-
--- ---------- Demo seed ----------
-insert into suppliers (name) values ('Mlimani Farm'), ('Kilimo o-op');
