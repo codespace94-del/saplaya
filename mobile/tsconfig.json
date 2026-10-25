@@ -1,6 +1,6 @@
 {
   "extends": "expo/tsconfig.base",
-  "compilerOptions": { "strict": true },
+  "compilerOptions": { "strict": true, "moduleSuffixes": [".ios", ".android", ".native", ""] },
   "include": ["**/*.ts", "**/*.tsx"],
   "exclude": ["backend", "node_modules"]
 }

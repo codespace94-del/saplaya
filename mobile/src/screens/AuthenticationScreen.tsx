@@ -119,7 +119,7 @@ export default function AuthenticationScreen({ navigation }: any) {
               </Text>
             </Pressable>
           )}
-          <Text style={styles.privacy}>Sign-in codes, email confirmation and passwords are handled securely by Supabase Authentication.</Text>
+          <Text style={styles.privacy}>Phone codes are verified by Firebase on native devices. Email accounts and web sign-in use Supabase Authentication.</Text>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>

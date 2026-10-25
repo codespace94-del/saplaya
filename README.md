@@ -43,10 +43,17 @@ Configure the Supabase and backend environment variables for the customer app an
 2. Run `supabase/mobile_account_payments.sql`. It creates customer profile/address/review storage, supplier applications, avatar storage, and the paid-checkout records and RPC.
 3. Run `supabase/002_roles.sql`. It adds team roles, farm status, and makes supplier applications work for both the website and the app.
 4. Run `supabase/pesapal_payments.sql`, `supabase/live_web_applications.sql`, `supabase/admin_settings.sql`, and `supabase/admin_operations.sql` to install payment fulfillment, public farm applications, delivery settings, and transactional stock restocking.
-5. Auth → Providers → enable **Anonymous sign-ins**, **Email**, and **Phone**. Configure a supported SMS provider and production SMTP/email templates in Supabase.
+5. Auth → Providers → enable **Anonymous sign-ins** and **Email** for Supabase customer guests, email accounts, and web team accounts. Firebase phone identity is configured separately below.
 6. Add website origins and `saplaya://auth/callback` to the Supabase Auth redirect allow-list. The mobile app deep link scheme is `saplaya`.
 7. Insert production products (each with a `supplier_id`) and rows in `promos`. Use hosted production photos for `image_url`.
 8. For the first Owner: create the user in Auth, then insert a `team_members` row (`role = 'platform_owner'`, `status = 'active'`, `user_id` = that user's id). The owner invites everyone else from the admin panel.
+
+### Firebase customer identity
+Mobile phone customers use native Firebase Auth; the web team/admin panel and mobile email accounts continue to use Supabase Auth. In Firebase, register Android package `com.saplaya.app` and iOS bundle ID `com.saplaya.app`, then place their client config files at `mobile/google-services.json` and `mobile/GoogleService-Info.plist`. The two files must belong to project `saplaya-v1`; each app ID must match `mobile/app.json`. Use an Expo development/release build because React Native Firebase native modules do not run in Expo Go. Enable Firebase as a third-party provider in the hosted Supabase project with project ID `saplaya-v1`; `supabase/config.toml` contains the matching local setting. Firebase ID tokens must include the `role: authenticated` custom claim before Supabase data requests can pass RLS.
+
+Run the baseline SQL files above first, then apply `supabase/migrations/20261024000000_firebase_auth_identity.sql`. It seeds mappings for existing Supabase users with verified phone numbers or email addresses, replaces customer RLS identity checks with a Firebase-aware UUID resolver, and keeps customer ownership tied to the existing `auth.users` UUID. The API bootstraps verified Firebase users at `POST /auth/firebase/bootstrap`, links by verified phone/email only, and sets the Firebase `authenticated` claim. If verified phone and email point to different existing accounts, linking is rejected for manual resolution.
+
+Set `FIREBASE_PROJECT_ID=saplaya-v1` and `FIREBASE_SERVICE_ACCOUNT_JSON` in Railway. The latter must be the Firebase Admin service-account JSON stored as a Railway secret; never commit it or put it in a client variable. For iOS phone auth, also configure Firebase's APNs/reCAPTCHA requirements for the registered app. Firebase phone verification SMS provider activation and billing are a separate setup step.
 
 ## 2. Backend (Railway)
 ```

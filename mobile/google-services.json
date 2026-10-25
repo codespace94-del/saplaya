@@ -1,0 +1,46 @@
+{
+  "project_info": {
+    "project_number": "1029991154349",
+    "project_id": "saplaya-v1",
+    "storage_bucket": "saplaya-v1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1029991154349:android:46433ed1f686d97dbdbc24",
+        "android_client_info": {
+          "package_name": "com.saplaya.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1029991154349-qop95nrfdla6l1f6mb5mdkf5fjpibcf0.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDhIUss31czli_rA0TAEMmKKkn6IS0x8L8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1029991154349-hutebl47h66l12omsqeb4i8iqofj4l9e.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "1029991154349-348fkl13bnqajt3m0tvfh74v75fbbjfp.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.saplaya.com"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

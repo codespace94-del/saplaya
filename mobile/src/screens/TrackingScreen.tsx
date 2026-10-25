@@ -13,7 +13,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { MotiView } from 'moti';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
-import { CustomerOrder, fetchOrderHistory, OrderItem, supabase } from '../lib/api';
+import { CustomerOrder, fetchOrderHistory, OrderItem } from '../lib/api';
+import { getCustomerDataContext } from '../lib/customer-auth';
 import RouteMap from '../components/RouteMap';
 import StatusPipeline from '../components/StatusPipeline';
 import { useStore } from '../store/StoreContext';
@@ -89,41 +90,49 @@ export default function TrackingScreen({ route }: any) {
     if (!selectedId) return;
 
     let active = true;
-    supabase.from('orders').select('status').eq('id', selectedId).maybeSingle()
-      .then(({ data, error }) => {
-        if (error) {
-          console.error('Could not load order status:', error.message);
-          return;
-        }
-        if (active && data) {
-          const nextStatus = data.status as OrderStatus;
-          setStatus(nextStatus);
-          setOrders((previous) => previous.map((order) => (
-            order.id === selectedId ? { ...order, status: nextStatus } : order
-          )));
-        }
-      }, (error: unknown) => {
-        if (active) console.error('Could not load order status:', error);
-      });
+    let removeChannel: (() => Promise<unknown>) | undefined;
+    void getCustomerDataContext().then(({ client }) => {
+      if (!active) return;
 
-    const channel = supabase
-      .channel(`order-${selectedId}`)
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'orders', filter: `id=eq.${selectedId}` },
-        (payload) => {
-          const nextStatus = (payload.new as { status: OrderStatus }).status;
-          setStatus(nextStatus);
-          setOrders((previous) => previous.map((order) => (
-            order.id === selectedId ? { ...order, status: nextStatus } : order
-          )));
-        },
-      )
-      .subscribe();
+      void client.from('orders').select('status').eq('id', selectedId).maybeSingle()
+        .then(({ data, error }) => {
+          if (error) {
+            console.error('Could not load order status:', error.message);
+            return;
+          }
+          if (active && data) {
+            const nextStatus = data.status as OrderStatus;
+            setStatus(nextStatus);
+            setOrders((previous) => previous.map((order) => (
+              order.id === selectedId ? { ...order, status: nextStatus } : order
+            )));
+          }
+        }, (error: unknown) => {
+          if (active) console.error('Could not load order status:', error);
+        });
+
+      const channel = client
+        .channel(`order-${selectedId}`)
+        .on(
+          'postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: 'orders', filter: `id=eq.${selectedId}` },
+          (payload) => {
+            const nextStatus = (payload.new as { status: OrderStatus }).status;
+            setStatus(nextStatus);
+            setOrders((previous) => previous.map((order) => (
+              order.id === selectedId ? { ...order, status: nextStatus } : order
+            )));
+          },
+        )
+        .subscribe();
+      removeChannel = () => client.removeChannel(channel);
+    }).catch((error: unknown) => {
+      if (active) console.error('Could not initialize order status tracking:', error);
+    });
 
     return () => {
       active = false;
-      void supabase.removeChannel(channel);
+      if (removeChannel) void removeChannel();
     };
   }, [selectedId]);
 

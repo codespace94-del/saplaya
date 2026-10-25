@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import { createClient, type SupabaseClientOptions } from '@supabase/supabase-js';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getAuth, type DecodedIdToken } from 'firebase-admin/auth';
 import WebSocket from 'ws';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
@@ -86,16 +88,205 @@ type Member = {
   id: string; user_id: string; supplier_id: string | null;
   full_name: string; email: string; role: Role; status: string;
 };
-type AuthedRequest = Request & { userId?: string; member?: Member };
+type AuthedRequest = Request & {
+  userId?: string;
+  authProvider?: 'supabase' | 'firebase';
+  member?: Member;
+};
 
 const isPlatform = (m: Member) => m.role === 'platform_owner' || m.role === 'platform_manager' || m.role === 'driver';
 
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID ?? 'saplaya-v1';
+const FIREBASE_APP_NAME = 'saplaya-backend';
+
+function getFirebaseAdminAuth() {
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!serviceAccountJson) {
+    throw new Error('Firebase server credentials are not configured.');
+  }
+
+  const parsedServiceAccount = z.object({
+    project_id: z.string().min(1),
+    client_email: z.string().email(),
+    private_key: z.string().min(1),
+  }).safeParse(JSON.parse(serviceAccountJson));
+  if (!parsedServiceAccount.success || parsedServiceAccount.data.project_id !== FIREBASE_PROJECT_ID) {
+    throw new Error('Firebase server credentials do not match the configured project.');
+  }
+
+  const existingApp = getApps().find((app) => app.name === FIREBASE_APP_NAME);
+  if (existingApp) return getAuth(existingApp);
+
+  const app = initializeApp({
+    credential: cert({
+      projectId: parsedServiceAccount.data.project_id,
+      clientEmail: parsedServiceAccount.data.client_email,
+      privateKey: parsedServiceAccount.data.private_key.replace(/\\n/g, '\n'),
+    }),
+    projectId: FIREBASE_PROJECT_ID,
+  }, FIREBASE_APP_NAME);
+  return getAuth(app);
+}
+
+function isFirebaseTokenForProject(token: string): boolean {
+  const payload = token.split('.')[1];
+  if (!payload) return false;
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (typeof claims !== 'object' || claims === null) return false;
+    const tokenClaims = claims as Record<string, unknown>;
+    return tokenClaims.aud === FIREBASE_PROJECT_ID
+      && tokenClaims.iss === `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`
+      && typeof tokenClaims.sub === 'string';
+  } catch {
+    return false;
+  }
+}
+
+async function findFirebaseIdentity(
+  firebaseUser: DecodedIdToken,
+): Promise<{ authUserId: string }> {
+  const { data: linkedIdentity, error: linkedError } = await db
+    .from('firebase_auth_identities')
+    .select('auth_user_id')
+    .eq('firebase_uid', firebaseUser.uid)
+    .maybeSingle();
+  if (linkedError) throw new Error('Could not look up the Firebase identity mapping.');
+  if (linkedIdentity) return { authUserId: linkedIdentity.auth_user_id };
+
+  const verifiedPhone = typeof firebaseUser.phone_number === 'string' ? firebaseUser.phone_number : null;
+  const verifiedEmail = firebaseUser.email_verified && typeof firebaseUser.email === 'string'
+    ? firebaseUser.email.trim().toLowerCase()
+    : null;
+  if (!verifiedPhone && !verifiedEmail) {
+    throw new Error('Verify a phone number or email address before linking this Firebase account.');
+  }
+
+  const candidates = new Map<string, { auth_user_id: string }>();
+  if (verifiedPhone) {
+    const { data, error } = await db.from('firebase_auth_identities')
+      .select('auth_user_id')
+      .eq('phone_e164', verifiedPhone)
+      .is('firebase_uid', null)
+      .limit(2);
+    if (error) throw new Error('Could not match the verified Firebase phone number.');
+    for (const identity of data ?? []) candidates.set(identity.auth_user_id, identity);
+  }
+  if (verifiedEmail) {
+    const { data, error } = await db.from('firebase_auth_identities')
+      .select('auth_user_id')
+      .eq('email', verifiedEmail)
+      .is('firebase_uid', null)
+      .limit(2);
+    if (error) throw new Error('Could not match the verified Firebase email address.');
+    for (const identity of data ?? []) candidates.set(identity.auth_user_id, identity);
+  }
+  if (candidates.size > 1) {
+    throw new Error('The verified Firebase phone and email belong to different existing accounts. Contact support to link them safely.');
+  }
+
+  let authUserId = [...candidates.keys()][0];
+  if (!authUserId) {
+    const { data, error } = await db.auth.admin.createUser({
+      ...(verifiedPhone ? { phone: verifiedPhone, phone_confirm: true } : {}),
+      ...(verifiedEmail ? { email: verifiedEmail, email_confirm: true } : {}),
+      user_metadata: {
+        ...(typeof firebaseUser.name === 'string' ? { full_name: firebaseUser.name } : {}),
+        auth_provider: 'firebase',
+      },
+    });
+    if (error || !data.user) {
+      throw new Error('Could not create the Supabase customer identity. If this email or phone already has an account, sign in to that account first.');
+    }
+    authUserId = data.user.id;
+
+    const { error: insertError } = await db.from('firebase_auth_identities').insert({
+      firebase_uid: firebaseUser.uid,
+      auth_user_id: authUserId,
+      phone_e164: verifiedPhone,
+      email: verifiedEmail,
+    });
+    if (insertError) {
+      const { data: racedIdentity } = await db.from('firebase_auth_identities')
+        .select('auth_user_id')
+        .eq('firebase_uid', firebaseUser.uid)
+        .maybeSingle();
+      if (racedIdentity) return { authUserId: racedIdentity.auth_user_id };
+
+      console.error('Could not persist a new Firebase identity mapping.', insertError.message);
+      const { error: cleanupError } = await db.auth.admin.deleteUser(authUserId);
+      if (cleanupError) {
+        console.error('Could not remove an unlinked Supabase Auth user.', cleanupError.message);
+      }
+      throw new Error('Could not finish setting up this customer account. Please retry.');
+    }
+    return { authUserId };
+  }
+
+  const { data: updatedIdentity, error: updateError } = await db
+    .from('firebase_auth_identities')
+    .update({ firebase_uid: firebaseUser.uid })
+    .eq('auth_user_id', authUserId)
+    .is('firebase_uid', null)
+    .select('auth_user_id')
+    .maybeSingle();
+  if (updateError) throw new Error('Could not link the verified Firebase identity.');
+  if (updatedIdentity) return { authUserId: updatedIdentity.auth_user_id };
+
+  const { data: racedIdentity, error: raceError } = await db
+    .from('firebase_auth_identities')
+    .select('auth_user_id')
+    .eq('firebase_uid', firebaseUser.uid)
+    .maybeSingle();
+  if (raceError || !racedIdentity || racedIdentity.auth_user_id !== authUserId) {
+    throw new Error('This Firebase account could not be linked safely. Please retry or contact support.');
+  }
+  return { authUserId };
+}
+
 async function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
+  const authorization = req.headers.authorization;
+  const token = authorization?.match(/^Bearer\s+(\S+)$/i)?.[1];
   if (!token) return res.status(401).json({ error: 'Missing token' });
+
   const { data, error } = await db.auth.getUser(token);
-  if (error || !data.user) return res.status(401).json({ error: 'Invalid token' });
-  req.userId = data.user.id;
+  if (!error && data.user) {
+    req.userId = data.user.id;
+    req.authProvider = 'supabase';
+    return next();
+  }
+
+  if (!isFirebaseTokenForProject(token)) return res.status(401).json({ error: 'Invalid token' });
+  let firebaseAuth;
+  try {
+    firebaseAuth = getFirebaseAdminAuth();
+  } catch (firebaseError) {
+    console.error('Firebase authentication configuration is unavailable.', firebaseError instanceof Error ? firebaseError.message : 'Unknown error');
+    return res.status(503).json({ error: 'Firebase authentication is not available. Check the server configuration.' });
+  }
+  let firebaseUser: DecodedIdToken;
+  try {
+    firebaseUser = await firebaseAuth.verifyIdToken(token, true);
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired Firebase token.' });
+  }
+  if (firebaseUser.role !== 'authenticated') {
+    return res.status(401).json({ error: 'Refresh the Firebase ID token after completing account setup.' });
+  }
+
+  const { data: identity, error: identityError } = await db
+    .from('firebase_auth_identities')
+    .select('auth_user_id')
+    .eq('firebase_uid', firebaseUser.uid)
+    .maybeSingle();
+  if (identityError) {
+    console.error('Firebase identity mapping lookup failed.', identityError.message);
+    return res.status(503).json({ error: 'Could not load the customer identity mapping.' });
+  }
+  if (!identity) return res.status(401).json({ error: 'Complete Firebase account setup before continuing.' });
+
+  req.userId = identity.auth_user_id;
+  req.authProvider = 'firebase';
   next();
 }
 
@@ -103,6 +294,9 @@ async function requireUser(req: AuthedRequest, res: Response, next: NextFunction
 function requirePerm(perm?: Perm) {
   return async (req: AuthedRequest, res: Response, next: NextFunction) => {
     await requireUser(req, res, async () => {
+      if (req.authProvider !== 'supabase') {
+        return res.status(403).json({ error: 'Web team accounts must sign in with Supabase Auth.' });
+      }
       const { data } = await db
         .from('team_members')
         .select('id, user_id, supplier_id, full_name, email, role, status')
@@ -154,6 +348,48 @@ function deliveryFor(km: number, settings: {
 }
 
 // ---------- Customer routes (suppliers are never exposed) ----------
+app.post('/auth/firebase/bootstrap', async (req, res) => {
+  const token = req.headers.authorization?.match(/^Bearer\s+(\S+)$/i)?.[1];
+  if (!token) return res.status(401).json({ error: 'Missing Firebase ID token.' });
+  if (!isFirebaseTokenForProject(token)) return res.status(401).json({ error: 'Invalid Firebase ID token.' });
+
+  let firebaseAuth;
+  try {
+    firebaseAuth = getFirebaseAdminAuth();
+  } catch (bootstrapError) {
+    console.error('Firebase authentication configuration is unavailable.', bootstrapError instanceof Error ? bootstrapError.message : 'Unknown error');
+    return res.status(503).json({ error: 'Firebase authentication is not available. Check the server configuration.' });
+  }
+  let firebaseUser: DecodedIdToken;
+  try {
+    firebaseUser = await firebaseAuth.verifyIdToken(token, true);
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired Firebase token.' });
+  }
+
+  try {
+    const identity = await findFirebaseIdentity(firebaseUser);
+    const firebaseRecord = await firebaseAuth.getUser(firebaseUser.uid);
+    const claims = firebaseRecord.customClaims ?? {};
+    const requiresTokenRefresh = claims.role !== 'authenticated';
+    if (requiresTokenRefresh) {
+      await firebaseAuth.setCustomUserClaims(firebaseUser.uid, {
+        ...claims,
+        role: 'authenticated',
+      });
+    }
+    return res.json({
+      customer_id: identity.authUserId,
+      requires_token_refresh: requiresTokenRefresh,
+    });
+  } catch (bootstrapError) {
+    const message = bootstrapError instanceof Error ? bootstrapError.message : 'Could not configure the Firebase account.';
+    console.error('Firebase account bootstrap failed.', message);
+    const status = message.includes('different existing accounts') || message.includes('already has an account') ? 409 : 503;
+    return res.status(status).json({ error: message });
+  }
+});
+
 app.get('/health', async (_req, res) => {
   const { error } = await db.from('storefront_products').select('id').limit(0);
   if (error) {

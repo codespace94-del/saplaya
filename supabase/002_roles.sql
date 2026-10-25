@@ -69,10 +69,14 @@ alter table supplier_applications add constraint supplier_applications_status_ch
 
 -- ---------- Helper used by row level security ----------
 create or replace function my_supplier_ids() returns setof uuid
-language sql stable security definer as $$
+language sql stable security definer
+set search_path = pg_catalog, public as $$
   select supplier_id from team_members
-  where user_id = auth.uid() and status = 'active' and supplier_id is not null
+  where user_id = (select public.current_supabase_auth_user_id())
+    and status = 'active' and supplier_id is not null
 $$;
+revoke all on function my_supplier_ids() from public, anon;
+grant execute on function my_supplier_ids() to authenticated;
 
 -- ---------- Replace the old single-admin policies ----------
 drop policy if exists "supplier own products" on products;
@@ -84,7 +88,8 @@ alter table suppliers drop column if exists admin_user_id;
 alter table team_members enable row level security;
 alter table supplier_applications enable row level security;   -- no policies: backend only
 
-create policy "see own team record" on team_members for select using (user_id = auth.uid());
+create policy "see own team record" on team_members for select
+  using (user_id = (select public.current_supabase_auth_user_id()));
 create policy "farm sees own record" on suppliers for select using (id in (select my_supplier_ids()));
 
 create policy "farm products" on products for select using (supplier_id in (select my_supplier_ids()));

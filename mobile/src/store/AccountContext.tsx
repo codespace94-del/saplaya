@@ -2,7 +2,18 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 import * as Linking from 'expo-linking';
 import type { User } from '@supabase/supabase-js';
 import type { ImagePickerAsset } from 'expo-image-picker';
-import { ensureSession, supabase } from '../lib/supabase';
+import { supabase } from '../lib/supabase';
+import {
+  getCurrentPhoneIdentity,
+  getCustomerDataContext,
+  sendPhoneOtp as sendCustomerPhoneOtp,
+  signOutPhoneAuth,
+  subscribePhoneAuth,
+  verifyPhoneOtp as verifyCustomerPhoneOtp,
+} from '../lib/customer-auth';
+import type { CustomerIdentity } from '../lib/customer-auth.types';
+
+type AccountUser = CustomerIdentity;
 
 export type AccountProfile = {
   fullName: string;
@@ -27,7 +38,7 @@ export type CustomerReview = {
 };
 
 type AccountContextValue = {
-  user: User | null;
+  user: AccountUser | null;
   isSignedIn: boolean;
   profile: AccountProfile;
   addresses: SavedAddress[];
@@ -58,29 +69,77 @@ function requireData<T>(data: T | null, error: { message: string } | null, messa
 }
 
 export function AccountProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<AccountUser | null>(null);
+  const [customerId, setCustomerId] = useState<string | null>(null);
   const [profile, setProfile] = useState<AccountProfile>(emptyProfile);
   const [addresses, setAddresses] = useState<SavedAddress[]>([]);
   const [reviews, setReviews] = useState<CustomerReview[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const mapSupabaseUser = useCallback((supabaseUser: User | null): AccountUser | null => {
+    if (!supabaseUser) return null;
+    return {
+      id: supabaseUser.id,
+      email: supabaseUser.email ?? null,
+      phone: supabaseUser.phone ?? null,
+      is_anonymous: Boolean(supabaseUser.is_anonymous),
+    };
+  }, []);
+
   useEffect(() => {
     let active = true;
+    let version = 0;
     supabase.auth.getSession().then(({ data, error: sessionError }) => {
       if (sessionError) throw sessionError;
-      if (active) setUser(data.session?.user ?? null);
+      if (active && !getCurrentPhoneIdentity()) {
+        const sessionUser = data.session?.user ?? null;
+        setUser(mapSupabaseUser(sessionUser));
+        setCustomerId(sessionUser?.id ?? null);
+      }
     }).catch((sessionError: unknown) => {
       if (active) setError(sessionError instanceof Error ? sessionError.message : 'Could not restore your account.');
     });
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (active) setUser(session?.user ?? null);
+      if (active && !getCurrentPhoneIdentity()) {
+        const sessionUser = session?.user ?? null;
+        setUser(mapSupabaseUser(sessionUser));
+        setCustomerId(sessionUser?.id ?? null);
+      }
+    });
+    const unsubscribePhoneAuth = subscribePhoneAuth((phoneUser) => {
+      const currentVersion = ++version;
+      if (!phoneUser) {
+        void supabase.auth.getSession().then(({ data, error: sessionError }) => {
+          if (sessionError) throw sessionError;
+          if (!active || currentVersion !== version) return;
+          const sessionUser = data.session?.user ?? null;
+          setUser(mapSupabaseUser(sessionUser));
+          setCustomerId(sessionUser?.id ?? null);
+        }).catch((sessionError: unknown) => {
+          if (active && currentVersion === version) {
+            setError(sessionError instanceof Error ? sessionError.message : 'Could not restore your account.');
+          }
+        });
+        return;
+      }
+
+      setUser(phoneUser);
+      setCustomerId(null);
+      void getCustomerDataContext().then(({ userId }) => {
+        if (active && currentVersion === version) setCustomerId(userId);
+      }).catch((identityError: unknown) => {
+        if (active && currentVersion === version) {
+          setError(identityError instanceof Error ? identityError.message : 'Could not restore your Firebase account.');
+        }
+      });
     });
     return () => {
       active = false;
       listener.subscription.unsubscribe();
+      unsubscribePhoneAuth();
     };
-  }, []);
+  }, [mapSupabaseUser]);
 
   useEffect(() => {
     let active = true;
@@ -135,11 +194,13 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
         }
         return;
       }
+      if (!customerId) return;
 
+      const { client, userId } = await getCustomerDataContext();
       const [profileResult, addressResult, reviewResult] = await Promise.all([
-        supabase.from('customer_profiles').select('full_name, phone, avatar_url').eq('customer_id', user.id).maybeSingle(),
-        supabase.from('customer_addresses').select('id, label, address, lat, lng, is_default').eq('customer_id', user.id).order('created_at', { ascending: false }),
-        supabase.from('customer_reviews').select('id, rating, message, created_at').eq('customer_id', user.id).order('created_at', { ascending: false }).limit(20),
+        client.from('customer_profiles').select('full_name, phone, avatar_url').eq('customer_id', userId).maybeSingle(),
+        client.from('customer_addresses').select('id, label, address, lat, lng, is_default').eq('customer_id', userId).order('created_at', { ascending: false }),
+        client.from('customer_reviews').select('id, rating, message, created_at').eq('customer_id', userId).order('created_at', { ascending: false }).limit(20),
       ]);
       if (profileResult.error || addressResult.error || reviewResult.error) {
         throw new Error(profileResult.error?.message ?? addressResult.error?.message ?? reviewResult.error?.message);
@@ -176,14 +237,16 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
     return () => {
       active = false;
     };
-  }, [user]);
+  }, [user, customerId]);
 
   const signIn = useCallback(async (email: string, password: string) => {
+    await signOutPhoneAuth();
     const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
     if (signInError) throw signInError;
   }, []);
 
   const register = useCallback(async (email: string, password: string, fullName: string) => {
+    await signOutPhoneAuth();
     const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
     if (sessionError) throw sessionError;
     if (sessionData.session?.user.is_anonymous) {
@@ -193,7 +256,10 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
         data: { full_name: fullName.trim() },
       });
       if (updateError) throw updateError;
-      if (data.user) setUser(data.user);
+      if (data.user) {
+        setUser(mapSupabaseUser(data.user));
+        setCustomerId(data.user.id);
+      }
       return false;
     }
     const { data, error: signUpError } = await supabase.auth.signUp({
@@ -202,35 +268,34 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
       options: { emailRedirectTo: Linking.createURL('auth/callback'), data: { full_name: fullName.trim() } },
     });
     if (signUpError) throw signUpError;
-    if (data.session?.user) setUser(data.session.user);
+    if (data.session?.user) {
+      setUser(mapSupabaseUser(data.session.user));
+      setCustomerId(data.session.user.id);
+    }
     return !data.session;
-  }, []);
+  }, [mapSupabaseUser]);
 
   const sendPhoneOtp = useCallback(async (phone: string, fullName?: string) => {
-    const { error: otpError } = await supabase.auth.signInWithOtp({
-      phone,
-      options: {
-        shouldCreateUser: true,
-        ...(fullName ? { data: { full_name: fullName.trim() } } : {}),
-      },
-    });
-    if (otpError) throw otpError;
+    await sendCustomerPhoneOtp(phone, fullName);
   }, []);
 
   const verifyPhoneOtp = useCallback(async (phone: string, token: string) => {
-    const { error: verifyError } = await supabase.auth.verifyOtp({ phone, token, type: 'sms' });
-    if (verifyError) throw verifyError;
+    const phoneUser = await verifyCustomerPhoneOtp(phone, token);
+    const { userId } = await getCustomerDataContext();
+    setUser(phoneUser);
+    setCustomerId(userId);
   }, []);
 
   const signOut = useCallback(async () => {
+    await signOutPhoneAuth();
     const { error: signOutError } = await supabase.auth.signOut();
     if (signOutError) throw signOutError;
   }, []);
 
   const saveProfile = useCallback(async (nextProfile: AccountProfile) => {
-    const session = await ensureSession();
-    const result = await supabase.from('customer_profiles').upsert({
-      customer_id: session.user.id,
+    const { client, userId } = await getCustomerDataContext();
+    const result = await client.from('customer_profiles').upsert({
+      customer_id: userId,
       full_name: nextProfile.fullName.trim(),
       phone: nextProfile.phone.trim(),
       avatar_url: nextProfile.avatarUrl,
@@ -242,25 +307,25 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
 
   const uploadAvatar = useCallback(async (asset: ImagePickerAsset) => {
     let avatarUrl = asset.uri;
-    const session = await ensureSession();
+    const { client, userId } = await getCustomerDataContext();
     const response = await fetch(asset.uri);
     if (!response.ok) throw new Error('Could not read the selected photo.');
     const file = await response.blob();
     const extension = asset.mimeType?.split('/')[1] ?? 'jpg';
-    const path = `${session.user.id}/${Date.now()}.${extension}`;
-    const { error: uploadError } = await supabase.storage.from('customer-avatars').upload(path, file, {
+    const path = `${userId}/${Date.now()}.${extension}`;
+    const { error: uploadError } = await client.storage.from('customer-avatars').upload(path, file, {
       contentType: asset.mimeType ?? 'image/jpeg',
       upsert: true,
     });
     if (uploadError) throw new Error(uploadError.message);
-    avatarUrl = supabase.storage.from('customer-avatars').getPublicUrl(path).data.publicUrl;
+    avatarUrl = client.storage.from('customer-avatars').getPublicUrl(path).data.publicUrl;
     await saveProfile({ ...profile, avatarUrl });
   }, [profile, saveProfile]);
 
   const addAddress = useCallback(async (input: Omit<SavedAddress, 'id' | 'isDefault'>) => {
-    const session = await ensureSession();
-    const { data, error: insertError } = await supabase.from('customer_addresses').insert({
-      customer_id: session.user.id,
+    const { client, userId } = await getCustomerDataContext();
+    const { data, error: insertError } = await client.from('customer_addresses').insert({
+      customer_id: userId,
       label: input.label.trim(),
       address: input.address.trim(),
       lat: input.lat,
@@ -274,21 +339,21 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
   const selectAddress = useCallback(async (id: string) => {
     const address = addresses.find((entry) => entry.id === id);
     if (!address) throw new Error('This saved address could not be found.');
-    const session = await ensureSession();
-    const { error: unsetError } = await supabase.from('customer_addresses')
-      .update({ is_default: false }).eq('customer_id', session.user.id);
+    const { client, userId } = await getCustomerDataContext();
+    const { error: unsetError } = await client.from('customer_addresses')
+      .update({ is_default: false }).eq('customer_id', userId);
     if (unsetError) throw new Error(unsetError.message);
-    const { error: setError } = await supabase.from('customer_addresses')
-      .update({ is_default: true }).eq('customer_id', session.user.id).eq('id', id);
+    const { error: setError } = await client.from('customer_addresses')
+      .update({ is_default: true }).eq('customer_id', userId).eq('id', id);
     if (setError) throw new Error(setError.message);
     const next = addresses.map((entry) => ({ ...entry, isDefault: entry.id === id }));
     setAddresses(next);
   }, [addresses]);
 
   const removeAddress = useCallback(async (id: string) => {
-    const session = await ensureSession();
-    const { error: deleteError } = await supabase.from('customer_addresses')
-      .delete().eq('customer_id', session.user.id).eq('id', id);
+    const { client, userId } = await getCustomerDataContext();
+    const { error: deleteError } = await client.from('customer_addresses')
+      .delete().eq('customer_id', userId).eq('id', id);
     if (deleteError) throw new Error(deleteError.message);
     const next = addresses.filter((entry) => entry.id !== id);
     if (!next.some((entry) => entry.isDefault) && next.length) next[0].isDefault = true;
@@ -300,9 +365,9 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
       throw new Error('Choose a rating and write a short review.');
     }
     let nextReview: CustomerReview;
-    const session = await ensureSession();
-    const { data, error: insertError } = await supabase.from('customer_reviews').insert({
-      customer_id: session.user.id,
+    const { client, userId } = await getCustomerDataContext();
+    const { data, error: insertError } = await client.from('customer_reviews').insert({
+      customer_id: userId,
       rating,
       message: message.trim(),
     }).select('id, rating, message, created_at').single();

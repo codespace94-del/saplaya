@@ -12,10 +12,12 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.saplaya.app"
+      "bundleIdentifier": "com.saplaya.app",
+      "googleServicesFile": "./GoogleService-Info.plist"
     },
     "android": {
-      "package": "com.saplaya.app"
+      "package": "com.saplaya.app",
+      "googleServicesFile": "./google-services.json"
     },
     "plugins": [
       [
@@ -24,7 +26,17 @@
           "locationWhenInUsePermission": "Saplaya uses your location to check for free close-area delivery."
         }
       ],
-      "expo-web-browser"
+      "expo-web-browser",
+      "@react-native-firebase/app",
+      "@react-native-firebase/auth",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "dynamic"
+          }
+        }
+      ]
     ]
   }
 }

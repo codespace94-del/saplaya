@@ -1,4 +1,5 @@
-import { API_URL, ensureSession, supabase } from './supabase';
+import { API_URL, supabase } from './supabase';
+import { getCustomerApiToken } from './customer-auth';
 import { Mode, Product, Promo } from '../types';
 
 const PAGE = 20;
@@ -21,11 +22,11 @@ type AuthenticatedOptions = {
 };
 
 async function authenticatedRequest<T>(path: string, options: AuthenticatedOptions = {}): Promise<T> {
-  const session = await ensureSession();
+  const token = await getCustomerApiToken();
   const response = await fetch(`${API_URL}${path}`, {
     method: options.method ?? 'GET',
     headers: {
-      Authorization: `Bearer ${session.access_token}`,
+      Authorization: `Bearer ${token}`,
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     },
     ...(options.body ? { body: JSON.stringify(options.body) } : {}),

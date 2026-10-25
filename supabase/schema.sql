@@ -173,6 +173,28 @@ create view storefront_products as
   from products where active and stock > 0;
 
 -- ---------- Row Level Security ----------
+create or replace function public.current_supabase_auth_user_id()
+returns uuid
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog, auth
+as $$
+declare
+  subject text := auth.jwt() ->> 'sub';
+begin
+  if (auth.jwt() ->> 'iss') is distinct from 'https://gycjliqtcstomzegfcbz.supabase.co/auth/v1'
+    or subject is null
+    or subject !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  then
+    return null;
+  end if;
+  return subject::uuid;
+end;
+$$;
+revoke all on function public.current_supabase_auth_user_id() from public, anon;
+grant execute on function public.current_supabase_auth_user_id() to authenticated;
+
 alter table suppliers enable row level security;
 alter table products enable row level security;
 alter table promos enable row level security;
@@ -190,13 +212,15 @@ create policy "own supplier_orders status" on supplier_orders for select
 
 -- Suppliers see only their own rows (admin panel).
 create policy "supplier own products" on products for all
-  using (supplier_id in (select id from suppliers where admin_user_id = auth.uid()));
+  using (supplier_id in (select id from suppliers where admin_user_id = (select public.current_supabase_auth_user_id())))
+  with check (supplier_id in (select id from suppliers where admin_user_id = (select public.current_supabase_auth_user_id())));
 create policy "supplier own orders" on supplier_orders for all
-  using (supplier_id in (select id from suppliers where admin_user_id = auth.uid()));
+  using (supplier_id in (select id from suppliers where admin_user_id = (select public.current_supabase_auth_user_id())))
+  with check (supplier_id in (select id from suppliers where admin_user_id = (select public.current_supabase_auth_user_id())));
 create policy "supplier own items" on order_items for select
-  using (supplier_id in (select id from suppliers where admin_user_id = auth.uid()));
+  using (supplier_id in (select id from suppliers where admin_user_id = (select public.current_supabase_auth_user_id())));
 create policy "supplier own movements" on inventory_movements for select
-  using (supplier_id in (select id from suppliers where admin_user_id = auth.uid()));
+  using (supplier_id in (select id from suppliers where admin_user_id = (select public.current_supabase_auth_user_id())));
 
 grant select on storefront_products to anon, authenticated;
 
